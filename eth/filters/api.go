@@ -38,12 +38,13 @@ import (
 // filter is a helper struct that holds meta information over the filter type
 // and associated subscription in the event system.
 type filter struct {
-	typ      Type
-	deadline *time.Timer // filter is inactiv when deadline triggers
-	hashes   []common.Hash
-	crit     FilterCriteria
-	logs     []*types.Log
-	s        *Subscription // associated subscription in event system
+	typ          Type
+	deadline     *time.Timer // filter is inactiv when deadline triggers
+	hashes       []common.Hash
+	transactions []*types.TxDetails
+	crit         FilterCriteria
+	logs         []*types.Log
+	s            *Subscription // associated subscription in event system
 }
 
 // PublicFilterAPI offers support to create and manage filters. This will allow external clients to retrieve various
@@ -139,6 +140,37 @@ func (api *PublicFilterAPI) NewPendingTransactionFilter() rpc.ID {
 	return pendingTxSub.ID
 }
 
+func (api *PublicFilterAPI) NewPendingTransactionFullFilter() rpc.ID {
+	var (
+		pendingTxs   = make(chan []*types.TxDetails)
+		pendingTxSub = api.events.SubscribePendingFullTxs(pendingTxs)
+	)
+
+	api.filtersMu.Lock()
+	api.filters[pendingTxSub.ID] = &filter{typ: PendingTransactionsFullSubscription, deadline: time.NewTimer(deadline), transactions: make([]*types.TxDetails, 0), s: pendingTxSub}
+	api.filtersMu.Unlock()
+
+	go func() {
+		for {
+			select {
+			case ph := <-pendingTxs:
+				api.filtersMu.Lock()
+				if f, found := api.filters[pendingTxSub.ID]; found {
+					f.transactions = append(f.transactions, ph...)
+				}
+				api.filtersMu.Unlock()
+			case <-pendingTxSub.Err():
+				api.filtersMu.Lock()
+				delete(api.filters, pendingTxSub.ID)
+				api.filtersMu.Unlock()
+				return
+			}
+		}
+	}()
+
+	return pendingTxSub.ID
+}
+
 // NewPendingTransactions creates a subscription that is triggered each time a transaction
 // enters the transaction pool and was signed from one of the transactions this nodes manages.
 func (api *PublicFilterAPI) NewPendingTransactions(ctx context.Context) (*rpc.Subscription, error) {
@@ -170,6 +202,39 @@ func (api *PublicFilterAPI) NewPendingTransactions(ctx context.Context) (*rpc.Su
 			}
 		}
 	})
+
+	return rpcSub, nil
+}
+
+func (api *PublicFilterAPI) NewPendingFullTransactions(ctx context.Context) (*rpc.Subscription, error) {
+	notifier, supported := rpc.NotifierFromContext(ctx)
+	if !supported {
+		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
+	}
+
+	rpcSub := notifier.CreateSubscription()
+
+	go func() {
+		txs := make(chan []*types.TxDetails, 128)
+		pendingTxSub := api.events.SubscribePendingFullTxs(txs)
+
+		for {
+			select {
+			case transactions := <-txs:
+				// To keep the original behaviour, send a single tx hash in one notification.
+				// TODO(rjl493456442) Send a batch of tx hashes in one notification
+				for _, t := range transactions {
+					notifier.Notify(rpcSub.ID, t)
+				}
+			case <-rpcSub.Err():
+				pendingTxSub.Unsubscribe()
+				return
+			case <-notifier.Closed():
+				pendingTxSub.Unsubscribe()
+				return
+			}
+		}
+	}()
 
 	return rpcSub, nil
 }
